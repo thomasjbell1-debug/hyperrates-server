@@ -20,7 +20,7 @@ function post(body) {
       path: '/info',
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-      timeout: 15000
+      timeout: 20000
     }, (res) => {
       let raw = '';
       res.on('data', chunk => raw += chunk);
@@ -33,12 +33,26 @@ function post(body) {
   });
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function postWithRetry(body, attempts = 4) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await post(body);
+    } catch(e) {
+      console.log(`Retry ${i+1} for ${body.coin || body.type}: ${e.message}`);
+      if (i < attempts - 1) await sleep(1000 * (i + 1));
+    }
+  }
+  throw new Error('All retries failed');
+}
+
 async function fetchFullHistory(coin, now) {
   const mid = now - 15 * 86400000;
   const start30 = now - 31 * 86400000;
   const [recent, older] = await Promise.all([
-    post({ type: 'fundingHistory', coin, startTime: mid, endTime: now }),
-    post({ type: 'fundingHistory', coin, startTime: start30, endTime: mid })
+    postWithRetry({ type: 'fundingHistory', coin, startTime: mid, endTime: now }),
+    postWithRetry({ type: 'fundingHistory', coin, startTime: start30, endTime: mid })
   ]);
   return [...(Array.isArray(older) ? older : []), ...(Array.isArray(recent) ? recent : [])];
 }
@@ -54,7 +68,6 @@ function calcAvgs(hist, now) {
   return avgs;
 }
 
-// In-memory cache
 let cache = null;
 let cacheTime = 0;
 let building = false;
@@ -65,7 +78,7 @@ async function buildCache() {
   console.log('Building cache...');
   try {
     const now = Date.now();
-    const [meta, ctxs] = await post({ type: 'metaAndAssetCtxs' });
+    const [meta, ctxs] = await postWithRetry({ type: 'metaAndAssetCtxs' });
     const MIN_OI = 1_000_000;
     const coins = [];
     meta.universe.forEach((asset, i) => {
@@ -81,28 +94,37 @@ async function buildCache() {
     });
     coins.sort((a, b) => b.oi - a.oi);
 
-    // Sequential fetch — no time limit on Render
+    // Sequential with retries and small delay between each
+    let success = 0, failed = 0;
     for (const row of coins) {
       try {
         const hist = await fetchFullHistory(row.coin, now);
-        if (hist.length > 0) Object.assign(row, calcAvgs(hist, now));
-      } catch(e) { console.log('Failed:', row.coin, e.message); }
+        if (hist.length > 0) {
+          Object.assign(row, calcAvgs(hist, now));
+          success++;
+        } else {
+          console.log(`Empty history for ${row.coin}`);
+          failed++;
+        }
+      } catch(e) {
+        console.log(`Failed ${row.coin}: ${e.message}`);
+        failed++;
+      }
+      await sleep(100); // Small delay to avoid rate limiting
     }
 
     cache = { coins, updatedAt: now };
     cacheTime = now;
-    console.log('Cache built —', coins.length, 'coins');
+    console.log(`Cache built — ${coins.length} coins, ${success} with history, ${failed} failed`);
   } catch(e) {
     console.error('Cache build failed:', e.message);
   }
   building = false;
 }
 
-// Build cache on startup, then every hour
 buildCache();
 setInterval(buildCache, 60 * 60 * 1000);
 
-// HTTP server
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -123,7 +145,12 @@ const server = http.createServer((req, res) => {
 
   if (req.url === '/health') {
     res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, cacheAge: cache ? Math.round((Date.now() - cacheTime) / 60000) + 'm' : 'building' }));
+    res.end(JSON.stringify({
+      ok: true,
+      cacheAge: cache ? Math.round((Date.now() - cacheTime) / 60000) + 'm' : 'building',
+      coins: cache ? cache.coins.length : 0,
+      withAvg24h: cache ? cache.coins.filter(c => c.avg24h !== null).length : 0
+    }));
     return;
   }
 
