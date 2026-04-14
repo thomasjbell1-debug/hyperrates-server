@@ -38,9 +38,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function postWithRetry(body, attempts = 4) {
   for (let i = 0; i < attempts; i++) {
     try {
-      return await post(body);
+      const result = await post(body);
+      return result;
     } catch(e) {
-      console.log(`Retry ${i+1} for ${body.coin || body.type}: ${e.message}`);
+      console.log(`Retry ${i+1}: ${e.message}`);
       if (i < attempts - 1) await sleep(1000 * (i + 1));
     }
   }
@@ -78,23 +79,38 @@ async function buildCache() {
   console.log('Building cache...');
   try {
     const now = Date.now();
-    const [meta, ctxs] = await postWithRetry({ type: 'metaAndAssetCtxs' });
+    
+    // Fetch meta with explicit error handling
+    const metaResult = await postWithRetry({ type: 'metaAndAssetCtxs' });
+    console.log('Meta result type:', typeof metaResult, Array.isArray(metaResult));
+    
+    // Handle both array and object responses
+    let meta, ctxs;
+    if (Array.isArray(metaResult)) {
+      [meta, ctxs] = metaResult;
+    } else if (metaResult && metaResult.universe) {
+      meta = metaResult;
+      ctxs = [];
+    } else {
+      throw new Error('Unexpected meta format: ' + JSON.stringify(metaResult).slice(0, 200));
+    }
+
     const MIN_OI = 1_000_000;
     const coins = [];
     meta.universe.forEach((asset, i) => {
-      const ctx = ctxs[i];
-      const oi = parseFloat(ctx.openInterest) * parseFloat(ctx.markPx);
+      const ctx = ctxs[i] || {};
+      const oi = parseFloat(ctx.openInterest || 0) * parseFloat(ctx.markPx || 0);
       if (isCrypto(asset.name) && oi >= MIN_OI) {
         coins.push({
           coin: asset.name, oi,
-          current: annualise(parseFloat(ctx.funding)),
+          current: annualise(parseFloat(ctx.funding || 0)),
           avg24h: null, avg3d: null, avg7d: null, avg14d: null, avg30d: null
         });
       }
     });
     coins.sort((a, b) => b.oi - a.oi);
+    console.log(`Found ${coins.length} coins above OI threshold`);
 
-    // Sequential with retries and small delay between each
     let success = 0, failed = 0;
     for (const row of coins) {
       try {
@@ -103,14 +119,13 @@ async function buildCache() {
           Object.assign(row, calcAvgs(hist, now));
           success++;
         } else {
-          console.log(`Empty history for ${row.coin}`);
           failed++;
         }
       } catch(e) {
         console.log(`Failed ${row.coin}: ${e.message}`);
         failed++;
       }
-      await sleep(100); // Small delay to avoid rate limiting
+      await sleep(100);
     }
 
     cache = { coins, updatedAt: now };
